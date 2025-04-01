@@ -1,6 +1,6 @@
 import type { BaseChatMemory } from '@langchain/community/memory/chat_memory';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
-import { HumanMessage } from '@langchain/core/messages';
+import { HumanMessage, AIMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { BaseMessagePromptTemplateLike } from '@langchain/core/prompts';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
@@ -376,6 +376,91 @@ export function preparePrompt(messages: BaseMessagePromptTemplateLike[]): ChatPr
 }
 
 /* -----------------------------------------------------------
+   ToolPreservingAgentExecutor Class Definition
+----------------------------------------------------------- */
+/**
+ * Custom AgentExecutor that preserves tool calls in memory
+ *
+ * This class extends the standard AgentExecutor but enhances it to properly
+ * save tool calls and their responses to memory after execution. The standard
+ * AgentExecutor only saves the final output string.
+ */
+class ToolPreservingAgentExecutor extends AgentExecutor {
+	/**
+	 * Override the invoke method to capture tool calls and save them to memory
+	 */
+	async invoke(input: Record<string, any>, options?: Record<string, any>) {
+		// Call the original invoke method to get the result
+		const result = await super.invoke(input, options);
+
+		// After execution, manually save intermediate steps to memory if memory is present
+		if (this.memory && result.intermediateSteps?.length > 0) {
+			const messages = [];
+
+			// Add each intermediate step as messages
+			for (const step of result.intermediateSteps as AgentAction[]) {
+				const action = (step as any).action;
+				const toolName = action?.tool;
+
+				// Check if action and toolName exist
+				if (action && toolName) {
+					// Construct a well-formed tool call with explicit typing
+					const toolInput = action.toolInput;
+					const toolCallId = action.toolCallId || `call_${Math.random().toString(36).slice(2)}`;
+					const toolCall = {
+						name: toolName,
+						args: typeof toolInput === 'string' ? { input: toolInput } : toolInput,
+						id: toolCallId,
+						type: "tool_call" as const, // Explicitly type it
+					};
+
+					// Create an AIMessage with the tool_calls structure
+					messages.push(
+						new AIMessage({
+							content: "", // Tool-calling AIMessage typically has empty content
+							tool_calls: [toolCall],
+						})
+					);
+
+					// Add the tool result as a ToolMessage
+					const observation = (step as any).observation || '';
+					messages.push(
+						new ToolMessage({
+							content: typeof observation === 'string'
+							? observation
+							: JSON.stringify(observation),
+							tool_call_id: toolCall.id,
+							name: toolName,
+						})
+					);
+				}
+			}
+
+			// Add the final output as an AIMessage, ensuring tool_calls is empty
+			let finalContent: string;
+			if (typeof result.output === "string") {
+				finalContent = result.output;
+			} else if (result.output instanceof AIMessage) {
+				// Extract content, discard any lingering tool_calls from the final raw output
+				finalContent = typeof result.output.content === 'string'
+					? result.output.content
+					: JSON.stringify(result.output.content);
+			} else {
+				// Handle any other unexpected output type
+				finalContent = JSON.stringify(result.output);
+			}
+			// Create the final AIMessage with the extracted content and empty tool_calls
+			messages.push(new AIMessage({ content: finalContent, tool_calls: [] }));
+
+			// Save all messages (including tool calls, tool results, and final answer) to memory
+			await this.memory.saveContext(input, { output: messages });
+		}
+
+		return result;
+	}
+}
+
+/* -----------------------------------------------------------
    Main Executor Function
 ----------------------------------------------------------- */
 /**
@@ -407,7 +492,7 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				promptTypeKey: 'promptType',
 			});
 			if (input === undefined) {
-				throw new NodeOperationError(this.getNode(), 'The “text” parameter is empty.');
+				throw new NodeOperationError(this.getNode(), 'The "text" parameter is empty.');
 			}
 
 			const options = this.getNodeParameter('options', itemIndex, {}) as {
@@ -439,15 +524,17 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				getAgentStepsParser(outputParser, memory),
 				fixEmptyContentMessage,
 			]);
-			const executor = AgentExecutor.fromAgentAndTools({
+
+			// Use the ToolPreservingAgentExecutor
+			const executor = new ToolPreservingAgentExecutor({
 				agent: runnableAgent,
 				memory,
 				tools,
-				returnIntermediateSteps: options.returnIntermediateSteps === true,
+				returnIntermediateSteps: true,
 				maxIterations: options.maxIterations ?? 10,
 			});
 
-			// Invoke the executor with the given input and system message.
+			// Invoke the executor with the given input and system message, WITHOUT the callback handler
 			const response = await executor.invoke(
 				{
 					input,
@@ -455,7 +542,9 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 					formatting_instructions:
 						'IMPORTANT: For your response to user, you MUST use the `format_final_json_response` tool with your complete answer formatted according to the required schema. Do not attempt to format the JSON manually - always use this tool. Your response will be rejected if it is not properly formatted through this tool. Only use this tool once you are ready to provide your final answer.',
 				},
-				{ signal: this.getExecutionCancelSignal() },
+				{
+					signal: this.getExecutionCancelSignal(),
+				},
 			);
 
 			// If memory and outputParser are connected, parse the output.
